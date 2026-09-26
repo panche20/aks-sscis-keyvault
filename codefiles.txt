@@ -1,0 +1,152 @@
+# =========================================================================
+# 1. Environment Variables & Subscription Setup
+# =========================================================================
+export SUBSCRIPTION_ID="8d997f5a-4075-48b9-a60e-42e57c76d3d5"
+export RESOURCE_GROUP="keyvault-demo"
+export LOCATION="eastus"
+export CLUSTER_NAME="keyvault-demo-cluster"
+export KEYVAULT_NAME="aks-demo-chetan"
+export UAMI="azurekeyvaultsecretsprovider-keyvault-demo-cluster"
+export FEDERATED_IDENTITY_NAME="aksfederatedidentity"
+export SERVICE_ACCOUNT_NAME="workload-identity-sa"
+export SERVICE_ACCOUNT_NAMESPACE="default"
+
+az account set --subscription "$SUBSCRIPTION_ID"
+
+# =========================================================================
+# 2. Register Providers & Create Resource Group
+# =========================================================================
+az provider register --namespace Microsoft.ContainerService --wait
+az provider register --namespace Microsoft.KeyVault --wait
+
+az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+
+# =========================================================================
+# 3. Create AKS Cluster & Fetch Kubeconfig
+# =========================================================================
+az aks create \
+  --name "$CLUSTER_NAME" \
+  -g "$RESOURCE_GROUP" \
+  --node-count 1 \
+  --node-vm-size Standard_D2s_v7 \
+  --enable-addons azure-keyvault-secrets-provider \
+  --enable-oidc-issuer \
+  --enable-workload-identity \
+  --generate-ssh-keys
+
+az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" --overwrite-existing
+
+# Verify CSI driver pods are running
+kubectl get pods -n kube-system -l 'app in (secrets-store-csi-driver,secrets-store-provider-azure)' -o wide
+
+# =========================================================================
+# 4. Create Key Vault & Grant User Access to Set Secrets
+# =========================================================================
+az keyvault create -n "$KEYVAULT_NAME" -g "$RESOURCE_GROUP" -l "$LOCATION" --enable-rbac-authorization
+
+export KEYVAULT_SCOPE=$(az keyvault show --name "$KEYVAULT_NAME" -g "$RESOURCE_GROUP" --query id -o tsv | tr -d '\r')
+export CURRENT_USER_OID=$(az ad signed-in-user show --query id -o tsv | tr -d '\r')
+
+# Grant your user account permissions to write secrets
+az role assignment create \
+  --role "Key Vault Secrets Officer" \
+  --assignee-object-id "$CURRENT_USER_OID" \
+  --assignee-principal-type User \
+  --scope "$KEYVAULT_SCOPE"
+
+# Wait a moment for RBAC propagation, then create the secret
+sleep 30
+az keyvault secret set --vault-name "$KEYVAULT_NAME" --name "secret1" --value "HelloFromKeyVault"
+
+# =========================================================================
+# 5. Create Managed Identity & Grant Read Permissions (RBAC)
+# =========================================================================
+az identity create --name "$UAMI" --resource-group "$RESOURCE_GROUP"
+
+export USER_ASSIGNED_CLIENT_ID=$(az identity show -g "$RESOURCE_GROUP" --name "$UAMI" --query clientId -o tsv | tr -d '\r')
+export USER_ASSIGNED_OBJECT_ID=$(az identity show -g "$RESOURCE_GROUP" --name "$UAMI" --query principalId -o tsv | tr -d '\r')
+export IDENTITY_TENANT=$(az aks show --name "$CLUSTER_NAME" -g "$RESOURCE_GROUP" --query identity.tenantId -o tsv | tr -d '\r')
+export AKS_OIDC_ISSUER=$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" --query "oidcIssuerProfile.issuerUrl" -o tsv | tr -d '\r')
+
+# Grant AKS Managed Identity permission to read secrets
+az role assignment create \
+  --role "Key Vault Secrets User" \
+  --assignee-object-id "$USER_ASSIGNED_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --scope "$KEYVAULT_SCOPE"
+
+# =========================================================================
+# 6. Establish OIDC Federated Credential
+# =========================================================================
+az identity federated-credential create \
+  --name "$FEDERATED_IDENTITY_NAME" \
+  --identity-name "$UAMI" \
+  --resource-group "$RESOURCE_GROUP" \
+  --issuer "${AKS_OIDC_ISSUER}" \
+  --subject "system:serviceaccount:${SERVICE_ACCOUNT_NAMESPACE}:${SERVICE_ACCOUNT_NAME}"
+
+# =========================================================================
+# 7. Apply Kubernetes Resources (SA, SecretProviderClass, Pod)
+# =========================================================================
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  annotations:
+    azure.workload.identity/client-id: ${USER_ASSIGNED_CLIENT_ID}
+  name: ${SERVICE_ACCOUNT_NAME}
+  namespace: ${SERVICE_ACCOUNT_NAMESPACE}
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: azure-kvname-wi
+  namespace: ${SERVICE_ACCOUNT_NAMESPACE}
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: "${USER_ASSIGNED_CLIENT_ID}"
+    keyvaultName: "${KEYVAULT_NAME}"
+    tenantId: "${IDENTITY_TENANT}"
+    objects: |
+      array:
+        - |
+          objectName: secret1
+          objectType: secret
+          objectVersion: ""
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: busybox-secrets-store-inline-wi
+  namespace: ${SERVICE_ACCOUNT_NAMESPACE}
+  labels:
+    azure.workload.identity/use: "true"
+spec:
+  serviceAccountName: "${SERVICE_ACCOUNT_NAME}"
+  containers:
+    - name: busybox
+      image: registry.k8s.io/e2e-test-images/busybox:1.29-4
+      command:
+        - "/bin/sleep"
+        - "10000"
+      volumeMounts:
+      - name: secrets-store01-inline
+        mountPath: "/mnt/secrets-store"
+        readOnly: true
+  volumes:
+    - name: secrets-store01-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: "azure-kvname-wi"
+EOF
+
+# =========================================================================
+# 8. Wait for Pod to Mount and Output Secret
+# =========================================================================
+kubectl wait --for=condition=Ready pod/busybox-secrets-store-inline-wi --timeout=90s
+
+kubectl exec busybox-secrets-store-inline-wi -- cat /mnt/secrets-store/secret1
